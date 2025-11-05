@@ -11,6 +11,9 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   image_transport
   roscpp
+  geometry_msgs
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -217,3 +220,16 @@ add_dependencies(hsv_calibrator ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXP
 target_link_libraries(hsv_calibrator
   ${catkin_LIBRARIES} ${OpenCv_LIBS}
 )
+
+add_executable(pub_param src/pub_param.cpp)
+add_dependencies(pub_param ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(pub_param
+  ${catkin_LIBRARIES} ${OpenCv_LIBS}
+)
+
+add_executable(pid_control src/pid_control.cpp)
+add_dependencies(pid_control ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(pid_control
+  ${catkin_LIBRARIES} ${OpenCv_LIBS}
+)
+
