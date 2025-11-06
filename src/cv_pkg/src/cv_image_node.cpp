@@ -90,6 +90,9 @@ std::vector<CubeFaceRecognizer::HSVColor> hsv_colors = {
     {cv::Scalar(0, 0, 102)  ,  cv::Scalar(20, 30, 130)}   // 数字6
 };
 
+int Aim_Num = 0;  //目标方块
+bool is_Aim = false; //防止同时识别多个面
+
 void Cam_RGB_Callback(const sensor_msgs::Image::ConstPtr& msg) {
     ros::Time img_stamp = msg->header.stamp;  // 记录当前RGB图像时间戳
 
@@ -104,7 +107,7 @@ void Cam_RGB_Callback(const sensor_msgs::Image::ConstPtr& msg) {
     cv::cvtColor(img_BGR888, img_hsv, cv::COLOR_BGR2HSV);
 
     // 过滤杂波与小方块
-    const double MIN_CONTOUR_AREA = 5000;  // 最小轮廓面积
+    const double MIN_CONTOUR_AREA = 6000;  // 最小轮廓面积
     const cv::Size ROI_SIZE(50, 50);       // 矫正后ROI尺寸
 
     // 获取模版文件的绝对路径
@@ -115,17 +118,11 @@ void Cam_RGB_Callback(const sensor_msgs::Image::ConstPtr& msg) {
     // 存储已处理物体的中心坐标（用于去重）
     std::vector<cv::Point2f> processed_centers;
     // 距离阈值（平方，避免开方运算，单位：像素²，根据实际物体大小调整）
-    const double DISTANCE_THRESHOLD_SQ = 3000;  // 例如：20像素的距离阈值
-
+    const double DISTANCE_THRESHOLD_SQ = 3000; 
 
     for (const auto& hsv : hsv_colors) {
         // 提取掩膜
         cv::Mat mask = Re.extractMask(img_hsv, hsv);
-        // 形态学闭运算填充小空洞，开运算去除小噪点
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
-        cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
-        cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
-
         // 查找并筛选轮廓
         std::vector<std::vector<cv::Point>> contours = Re.findAndFilterContours(mask, MIN_CONTOUR_AREA);
         if (contours.empty()){
@@ -182,7 +179,12 @@ void Cam_RGB_Callback(const sensor_msgs::Image::ConstPtr& msg) {
             char recognized_char;
             Re.convertMatchResult(best_match, recognized_digit, recognized_char);
 
-            Re.Aim_TF_Pub(corners);
+            //仅发布一次目标数字的tf
+            if(recognized_digit == Aim_Num && is_Aim == false){
+                ros::param::set("is_grip",false);   //更新是否抓取到方块的状态
+                is_Aim == true;
+                Re.Aim_TF_Pub(corners);
+            }
 
             // 可视化结果
             Re.visualizeResults(img_BGR888, contour, corners, current_obj_id, recognized_digit, recognized_char);
@@ -204,30 +206,23 @@ void Cam_RGB_Callback(const sensor_msgs::Image::ConstPtr& msg) {
     cv::waitKey(1);
 }
 
-/**
- * @brief 深度图像回调函数：缓存深度图像
- */
-void depthImageCallback(const sensor_msgs::Image::ConstPtr& msg) {
-    std::lock_guard<std::mutex> lock(Re.depth_mutex); // 线程安全
-    try {
-        // 关键修改：将解析格式改为32FC1（与Python一致）
-        Re.cached_depth_img = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1)->image;
-        Re.depth_initialized = true;
-    } catch (cv_bridge::Exception& e) {
-        printf("深度图像转换失败: %s\n", e.what());
-        Re.depth_initialized = false;
-    }
-}
+//获取参数服务器中设置的目标数字
+void Aim_NumCallback(const ros::TimerEvent&){
+    static ros::NodeHandle nh2;
 
+    nh2.getParam("/Aim_Num", Aim_Num);
+}
 
 int main(int argc, char**argv) {
     setlocale(LC_ALL, "zh_CN.UTF-8");
     ros::init(argc, argv, "cv_image_node");
-    ros::NodeHandle nh;
 
+    ros::NodeHandle nh;
     // 订阅图像话题
     ros::Subscriber rgb_sub = nh.subscribe("/camera/color/image_raw", 1, Cam_RGB_Callback);
-    ros::Subscriber depth_sub = nh.subscribe("/camera/aligned_depth_to_color/image_raw",10,depthImageCallback);
+    // 注册参数变化（监听指定参数）
+    ros::Timer param_check_timer = nh.createTimer(ros::Duration(0.1), 
+                                           &Aim_NumCallback);
 
     tf2_ros::TransformListener listener(buffer);
 
@@ -241,68 +236,31 @@ int main(int argc, char**argv) {
 
 // 角点排序函数：将四边形角点按顺时针排序（左上->右上->右下->左下）
 void CubeFaceRecognizer::sortCorners(std::vector<cv::Point>& corners) {
-    if (corners.size() != 4) {
-        ROS_WARN("角点数量不为4,无法排序");
-        return;
-    }
+    if (corners.size() != 4) return;
 
-    // 步骤1：计算四边形中心坐标（用于象限划分）
-    cv::Point2f center(0, 0);
-    for (const auto& p : corners) {
-        center.x += p.x;
-        center.y += p.y;
-    }
-    center.x /= 4.0f;
-    center.y /= 4.0f;
+    std::vector<size_t> idx(4);
+    std::iota(idx.begin(), idx.end(), 0);
 
-    // 步骤2：按“相对于中心的象限”排序（确保唯一顺序）
-    std::vector<cv::Point> sorted(4);
-    int idx = 0;
+    // 按 x+y 升序 → 左上 vs 右下
+    std::sort(idx.begin(), idx.end(),
+              [&](size_t a, size_t b) {
+                  return (corners[a].x + corners[a].y) < (corners[b].x + corners[b].y);
+              });
+    cv::Point top_left     = corners[idx[0]];
+    cv::Point bottom_right = corners[idx[3]];
 
-    // 左上象限：x < 中心x 且 y < 中心y（优先级最高）
-    for (const auto& p : corners) {
-        if (p.x < center.x - 1e-3 && p.y < center.y - 1e-3) {  // 减微小值避免浮点误差
-            sorted[idx++] = p;
-            break;
-        }
-    }
+    // 按 x-y 降序 → 右上 vs 左下
+    std::sort(idx.begin(), idx.end(),
+              [&](size_t a, size_t b) {
+                  return (corners[a].x - corners[a].y) > (corners[b].x - corners[b].y);
+              });
+    cv::Point top_right    = corners[idx[0]];
+    cv::Point bottom_left  = corners[idx[3]];
 
-    // 右上象限：x > 中心x 且 y < 中心y
-    for (const auto& p : corners) {
-        if (p.x > center.x + 1e-3 && p.y < center.y - 1e-3 && 
-            std::find(sorted.begin(), sorted.begin() + idx, p) == sorted.begin() + idx) {
-            sorted[idx++] = p;
-            break;
-        }
-    }
-
-    // 右下象限：x > 中心x 且 y > 中心y
-    for (const auto& p : corners) {
-        if (p.x > center.x + 1e-3 && p.y > center.y + 1e-3 && 
-            std::find(sorted.begin(), sorted.begin() + idx, p) == sorted.begin() + idx) {
-            sorted[idx++] = p;
-            break;
-        }
-    }
-
-    // 左下象限：x < 中心x 且 y > 中心y（剩余的最后一个点）
-    for (const auto& p : corners) {
-        if (std::find(sorted.begin(), sorted.begin() + idx, p) == sorted.begin() + idx) {
-            sorted[idx++] = p;
-            break;
-        }
-    }
-
-    // 替换原角点（若排序成功）
-    if (idx == 4) {
-        corners = sorted;
-    } else {
-        ROS_WARN("角点排序失败，使用备用方案");
-        // 备用方案：按“x+y”之和排序（左上和最小，右下和最大）
-        std::sort(corners.begin(), corners.end(), [](const cv::Point& a, const cv::Point& b) {
-            return (a.x + a.y) < (b.x + b.y);
-        });
-    }
+    corners[0] = top_left;
+    corners[1] = top_right;
+    corners[2] = bottom_right;
+    corners[3] = bottom_left;
 }
 
 /**
@@ -315,7 +273,7 @@ cv::Mat CubeFaceRecognizer::rosImageToCvMat(const sensor_msgs::Image::ConstPtr& 
         cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
         return cv_ptr->image;
     } catch (const std::exception& e) {
-        ROS_ERROR("cv_bridge exception: %s", e.what());
+        printf("cv_bridge exception: %s\n", e.what());
         return cv::Mat();
     }
 }
@@ -402,7 +360,7 @@ cv::Mat CubeFaceRecognizer::perspectiveTransformRoi(const cv::Mat& src_img,
  */
 int CubeFaceRecognizer::matchTemplateDigit(const cv::Mat& roi, const std::string& template_dir) {
     int best_match = -1;
-    double max_match_val = 0.15;  // 匹配阈值
+    double max_match_val = 0.1;  // 匹配阈值
 
     for (int digit = 1; digit <= 27; digit++) {
         std::string template_path = template_dir + std::to_string(digit) + ".png";
@@ -692,11 +650,12 @@ void CubeFaceRecognizer::Aim_TF_Pub(std::vector<cv::Point>& corners){
     }
 
     // 3D目标点（顺序与角点排序一致：左上→右上→右下→左下）
+    // 坐标系方向采用右手原则
     std::vector<cv::Point3f> object_points = {
-        cv::Point3f(0, 0, 0),
-        cv::Point3f(0, -1.5*squareSize, 0),
-        cv::Point3f(0, -1.5*squareSize, -1.5*squareSize),
-        cv::Point3f(0, 0, -1.5*squareSize)
+        cv::Point3f(0,  0.5*squareSize, 0.5*squareSize),
+        cv::Point3f(0, -0.5*squareSize, 0.5*squareSize),
+        cv::Point3f(0, -0.5*squareSize, -0.5*squareSize),
+        cv::Point3f(0,  0.5*squareSize, -0.5*squareSize)
     };
 
     // 1. 原始位姿解算（沿用原有逻辑）
